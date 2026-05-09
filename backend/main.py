@@ -17,12 +17,13 @@ import io
 import threading
 import math
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from openai import APIError, OpenAI, RateLimitError
 
 app = FastAPI(title="Bocconi AI Buddy")
@@ -61,6 +62,51 @@ class AskResponse(BaseModel):
     verticale: Verticale
 
 
+Rarity = Literal["common", "uncommon", "rare", "ultra-rare"]
+DatasetSnapshot = Literal["2026-05-02", "live"]
+CardDecisionAction = Literal["created", "already_owned", "skipped"]
+CardImageSource = Literal["dataset", "unsplash", "placeholder"]
+
+
+class BocCard(BaseModel):
+    id: str
+    vertical: Verticale
+    title: str
+    body: str
+    longBody: str | None = None
+    factTag: str
+    imageQuery: str
+    imageUrl: str | None = None
+    imageAlt: str | None = None
+    imageSource: CardImageSource | None = None
+    rarity: Rarity
+    isStarter: bool
+    sourceLabel: str
+    datasetSnapshot: DatasetSnapshot
+    unlockedAt: str | None = None
+    tags: list[str] = Field(default_factory=list)
+
+
+class CardDecisionRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    question: str = Field(...)
+    answer: str = Field(...)
+    sources: list[str] = Field(default_factory=list)
+    verticale: Verticale
+    cards: list[BocCard] = Field(default_factory=list)
+    collected_card_ids: list[str] = Field(default_factory=list, alias="collectedCardIds")
+
+
+class CardDecisionResponse(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    action: CardDecisionAction
+    card: BocCard | None = None
+    existing_card_id: str | None = Field(default=None, alias="existingCardId")
+    message: str
+
+
 VERTICALI: tuple[Verticale, ...] = (
     "relocation",
     "life_on_campus",
@@ -80,6 +126,7 @@ MIN_SCOPE_OVERLAP = int(os.environ.get("MIN_SCOPE_OVERLAP", "2"))
 SEARCH_AGENT_SCRIPT = Path(__file__).parent / "scripts" / "trusted_sources_agent.py"
 MIN_SCOPE_COVERAGE = float(os.environ.get("MIN_SCOPE_COVERAGE", "0.18"))
 API_CACHE_TTL_SECONDS = int(os.environ.get("API_CACHE_TTL_SECONDS", "1800"))
+DISABLE_API_CACHE = os.environ.get("DISABLE_API_CACHE", "0") == "1"
 EMBEDDING_RERANK_ENABLED = os.environ.get("EMBEDDING_RERANK_ENABLED", "1") == "1"
 EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "text-embedding-3-small")
 EMBEDDING_RERANK_CANDIDATES = int(os.environ.get("EMBEDDING_RERANK_CANDIDATES", "18"))
@@ -531,6 +578,13 @@ def _relocation_intent_adjustment(question: str, doc: Document) -> float:
         score += 2.5
     if "housing" in text and "tuition" not in text and "scholarship" not in text:
         score -= 3.0
+
+    fiscal_intent = any(t in q for t in ("codice fiscale", "fiscal code", "tax code"))
+    if fiscal_intent:
+        if any(t in text for t in ("immigration", "fiscal", "codice fiscale", "permit", "visa", "required documents")):
+            score += 3.0
+        if "housing" in text and "immigration" not in text:
+            score -= 2.5
     return score
 
 
@@ -734,9 +788,96 @@ def _retrieve_docs(question: str, verticale: Verticale, k: int = TOP_K) -> list[
                         break
                     if d.path not in used:
                         top.append(d)
-                return top[:k]
+                filtered = top + [d for d in filtered if d.path not in {x.path for x in top}]
 
-    return filtered[:k]
+    # Diversity pass (MMR-lite): keep high relevance but reduce near-duplicate pages.
+    selected: list[Document] = []
+    selected_paths: set[str] = set()
+    for d in filtered:
+        if d.path in selected_paths:
+            continue
+        d_tokens = set(_tokenize(d.title_text + " " + _norm_text(d.path)))
+        too_similar = False
+        for s in selected:
+            s_tokens = set(_tokenize(s.title_text + " " + _norm_text(s.path)))
+            jacc = len(d_tokens & s_tokens) / max(1, len(d_tokens | s_tokens))
+            if jacc > 0.72:
+                too_similar = True
+                break
+        if not too_similar:
+            selected.append(d)
+            selected_paths.add(d.path)
+        if len(selected) >= k:
+            break
+
+    if len(selected) < k:
+        for d in filtered:
+            if d.path in selected_paths:
+                continue
+            selected.append(d)
+            selected_paths.add(d.path)
+            if len(selected) >= k:
+                break
+
+    return selected[:k]
+
+
+def _clean_context_text(text: str) -> str:
+    # Reduce markdown/navigation noise before passing context to the generator.
+    t = text
+    t = re.sub(r"!\[[^\]]*\]\([^)]+\)", " ", t)  # images
+    t = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1", t)  # links
+    t = re.sub(r"#+\s*", " ", t)  # headings
+    t = re.sub(r"\*\*+", "", t)
+    t = re.sub(r"_+", "", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+
+def _query_focused_context(doc: Document, question: str, max_sentences: int = 5) -> str:
+    q_tokens = {t for t in _tokenize(_norm_text(question)) if len(t) >= 3}
+    if not q_tokens:
+        return _clean_context_text(doc.content[:800])
+
+    bad_noise = (
+        "learning how to search",
+        "get to know the library",
+        "website navigation",
+        "breadcrumb",
+        "cookie policy",
+    )
+    scored: list[tuple[float, str]] = []
+    raw = _clean_context_text(doc.content)
+    for s in re.split(r"(?<=[.!?])\s+", raw):
+        sent = s.strip()
+        if len(sent) < 35 or len(sent) > 280:
+            continue
+        ns = _norm_text(sent)
+        if any(b in ns for b in bad_noise):
+            continue
+        overlap = len(q_tokens & set(_tokenize(ns)))
+        if overlap <= 0:
+            continue
+        score = float(overlap)
+        if any(k in ns for k in ("must", "required", "deadline", "apply", "request", "documents", "eligibility")):
+            score += 0.4
+        scored.append((score, sent))
+
+    if not scored:
+        return _clean_context_text(doc.content[:800])
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    picked: list[str] = []
+    seen = set()
+    for _, sent in scored:
+        key = _norm_text(sent)
+        if key in seen:
+            continue
+        seen.add(key)
+        picked.append(sent)
+        if len(picked) >= max_sentences:
+            break
+    return " ".join(picked)
 
 
 def _retrieval_overlap_score(question: str, docs: list[Document]) -> int:
@@ -774,6 +915,45 @@ def _is_weather_question(question: str) -> bool:
     q = _norm_text(question)
     weather_terms = ("weather", "umbrella", "rain", "forecast", "temperature")
     return any(t in q for t in weather_terms)
+
+
+def _is_high_risk_live_fact_question(question: str) -> bool:
+    q = _norm_text(question)
+    exact_markers = ("exact", "live", "right now", "at ")
+    weather_markers = ("weather", "forecast", "temperature", "umbrella")
+    return any(m in q for m in exact_markers) and any(w in q for w in weather_markers)
+
+
+def _has_unavailability_guard(question: str) -> bool:
+    q = _norm_text(question)
+    return any(
+        p in q
+        for p in (
+            "if unavailable in data",
+            "if unavailable",
+            "if not available",
+            "if you cannot find",
+            "if not in the data",
+        )
+    )
+
+
+def _is_exact_deadline_question(question: str) -> bool:
+    q = _norm_text(question)
+    return "deadline" in q and any(m in q for m in ("exact", "this cycle", "current cycle"))
+
+
+def _supports_entity_in_docs(question: str, docs: list[Document]) -> bool:
+    q = _norm_text(question)
+    probe_terms: list[str] = []
+    if "mit" in q or "massachusetts institute of technology" in q:
+        probe_terms.extend(["mit", "massachusetts institute of technology"])
+    if "deadline" in q:
+        probe_terms.append("deadline")
+    if not probe_terms:
+        return True
+    hay = " ".join((_norm_text(d.title + " " + d.path + " " + d.content[:700])) for d in docs[:6])
+    return all(t in hay for t in probe_terms)
 
 
 def _is_transport_question(question: str) -> bool:
@@ -835,6 +1015,8 @@ def _is_events_question(question: str) -> bool:
 
 
 def _cache_get(key: str) -> tuple[str, list[str]] | None | str:
+    if DISABLE_API_CACHE:
+        return "__MISS__"
     now = time.time()
     with _API_CACHE_LOCK:
         hit = _API_CACHE.get(key)
@@ -849,6 +1031,8 @@ def _cache_get(key: str) -> tuple[str, list[str]] | None | str:
 
 
 def _cache_set(key: str, value: tuple[str, list[str]] | None) -> None:
+    if DISABLE_API_CACHE:
+        return
     with _API_CACHE_LOCK:
         _API_CACHE[key] = (time.time(), value)
 
@@ -1035,6 +1219,23 @@ def _is_travel_safety_question(question: str) -> bool:
     return any(t in q for t in intent_terms)
 
 
+def _is_multi_intent_question(question: str) -> bool:
+    q = _norm_text(question)
+    buckets = 0
+    if any(t in q for t in ("exchange", "double degree", "study abroad", "visa", "departure", "incoming")):
+        buckets += 1
+    if any(t in q for t in ("safe", "safety", "risk", "dangerous", "travel advisory", "security", "sicurezza")):
+        buckets += 1
+    if any(t in q for t in ("housing", "accommodation", "residence", "alloggio", "dorm", "support")):
+        buckets += 1
+    if any(t in q for t in ("career", "internship", "placement", "job", "cv", "tirocinio")):
+        buckets += 1
+
+    # Conjunction-style phrasing often signals multiple asks in one message.
+    connector_hit = any(t in q for t in (" and ", " also ", " plus ", " as well as ", "where", "what should i do first"))
+    return buckets >= 2 or (buckets >= 1 and connector_hit and q.count("?") <= 1)
+
+
 def _extract_country_iso3(question: str) -> str | None:
     q = _norm_text(question)
     for name, iso3 in COUNTRY_ISO3.items():
@@ -1168,12 +1369,13 @@ def _call_llm_with_retry(messages: list[dict[str, str]]) -> str | None:
 def _build_prompt(question: str, verticale: Verticale, docs: list[Document]) -> list[dict[str, str]]:
     context_blocks: list[str] = []
     for i, d in enumerate(docs, start=1):
+        focused = _query_focused_context(d, question, max_sentences=5)
         context_blocks.append(
             (
                 f"[DOC {i}] path={d.path}\n"
                 f"title={d.title}\n"
                 f"verticale={d.verticale}\n"
-                f"content:\n{d.content}"
+                f"content:\n{focused}"
             )
         )
 
@@ -1183,13 +1385,16 @@ def _build_prompt(question: str, verticale: Verticale, docs: list[Document]) -> 
         "Be concise, factual, and avoid hallucinations. "
         "Keep original Bocconi terms and names. "
         "Reply in the same language as the user question when possible. "
-        "Do not include website navigation artifacts or markdown boilerplate."
+        "Do not include website navigation artifacts or markdown boilerplate. "
+        "Do not include unrelated topics, even if they appear in context."
     )
     answer_shape = (
         "Answer format:\n"
         "1) Short answer (1-2 sentences)\n"
         "2) Recommended path at Bocconi (3-5 bullet points)\n"
         "3) Concrete next actions this month (2-4 bullet points)\n"
+        "Each bullet must be directly relevant to the user's exact question.\n"
+        "If multiple constraints are asked, cover each constraint explicitly.\n"
         "If the question is about sustainability careers, include relevant courses/programs, internship guidance, and career-service touchpoints when present in context."
     )
     user = (
@@ -1205,20 +1410,48 @@ def _build_prompt(question: str, verticale: Verticale, docs: list[Document]) -> 
 
 
 def _extractive_fallback_answer(question: str, docs: list[Document]) -> str:
-    q_tokens = set(_tokenize(question))
+    q_norm = _norm_text(question)
+    q_tokens = {t for t in _tokenize(q_norm) if len(t) >= 3}
     if not q_tokens:
-        q_tokens = set(_tokenize(_norm_text(question)))
+        return "I cannot answer right now."
 
-    candidates: list[tuple[int, str]] = []
-    for doc in docs[:4]:
+    navigation_artifacts = (
+        "get to know the library",
+        "library website",
+        "learning how to search",
+        "website navigation",
+        "click",
+        "breadcrumb",
+    )
+
+    # Prioritize docs with strongest query overlap first.
+    ranked_docs: list[tuple[int, Document]] = []
+    for d in docs[:6]:
+        doc_overlap = len(q_tokens & d.token_set)
+        if doc_overlap > 0:
+            ranked_docs.append((doc_overlap, d))
+    ranked_docs.sort(key=lambda x: x[0], reverse=True)
+
+    candidates: list[tuple[float, str]] = []
+    for _, doc in ranked_docs[:4]:
         for raw_sentence in re.split(r"(?<=[.!?])\s+", doc.content):
-            sentence = raw_sentence.strip()
-            if len(sentence) < 50 or len(sentence) > 280:
+            sentence = re.sub(r"\s+", " ", raw_sentence).strip()
+            if len(sentence) < 35 or len(sentence) > 260:
                 continue
             norm_sentence = _norm_text(sentence)
-            overlap = sum(1 for t in q_tokens if t in norm_sentence)
-            if overlap > 0:
-                candidates.append((overlap, sentence))
+            if any(a in norm_sentence for a in navigation_artifacts):
+                continue
+            overlap = len(q_tokens & set(_tokenize(norm_sentence)))
+            if overlap <= 0:
+                continue
+            # Keep only clearly relevant snippets.
+            density = overlap / max(1, len(q_tokens))
+            if overlap == 1 and density < 0.20:
+                continue
+            # Prefer practical/actionable language for procedural questions.
+            action_bonus = 0.3 if any(w in norm_sentence for w in ("must", "required", "request", "apply", "need", "documents")) else 0.0
+            score = overlap + density + action_bonus
+            candidates.append((score, sentence))
 
     if not candidates:
         return "I cannot answer right now."
@@ -1235,7 +1468,684 @@ def _extractive_fallback_answer(question: str, docs: list[Document]) -> str:
         if len(picked) == 3:
             break
 
-    return " ".join(picked) if picked else "I cannot answer right now."
+    if not picked:
+        return "I cannot answer right now."
+    if len(picked) == 1:
+        return picked[0]
+    return "Based on Bocconi information, here is the most relevant guidance:\n- " + "\n- ".join(picked)
+
+
+def _is_procedural_question(question: str) -> bool:
+    q = _norm_text(question)
+    procedural_starters = (
+        "how do i",
+        "how can i",
+        "what should i do",
+        "steps to",
+        "how to",
+        "what do i need",
+        "which documents do i need",
+    )
+    intent_terms = (
+        "codice fiscale",
+        "fiscal code",
+        "visa",
+        "permit of stay",
+        "permesso",
+        "ssn",
+        "health service",
+        "housing application",
+        "exchange",
+        "double degree",
+        "internship",
+        "career services",
+    )
+    return any(s in q for s in procedural_starters) or any(t in q for t in intent_terms)
+
+
+def _should_use_procedural_override(question: str) -> bool:
+    q = _norm_text(question)
+    # Keep deterministic mode for operational "how-to" tasks, but avoid
+    # overriding complex comparative/multi-constraint prompts where LLM synthesis is better.
+    complex_markers = (
+        "compare",
+        "difference",
+        "vs",
+        "versus",
+        "pros and cons",
+        "timeline and",
+        "covering",
+        "checklist covering",
+        "main differences",
+        "what are the differences",
+    )
+    if any(m in q for m in complex_markers):
+        return False
+    if _has_unavailability_guard(question) and _is_exact_deadline_question(question):
+        return False
+    # Multi-intent questions should go through full RAG synthesis.
+    if _is_multi_intent_question(question):
+        return False
+    return _is_procedural_question(question)
+
+
+def _contains_concrete_date(text: str) -> bool:
+    t = _norm_text(text)
+    # Supports common date shapes: YYYY-MM-DD, DD/MM/YYYY, and month-name forms.
+    if re.search(r"\b20\d{2}-\d{2}-\d{2}\b", t):
+        return True
+    if re.search(r"\b\d{1,2}/\d{1,2}/20\d{2}\b", t):
+        return True
+    if re.search(
+        r"\b\d{1,2}\s+(january|february|march|april|may|june|july|august|september|october|november|december)\b",
+        t,
+    ):
+        return True
+    return False
+
+
+def _build_procedural_answer(question: str, docs: list[Document], verticale: Verticale) -> str | None:
+    q_tokens = {t for t in _tokenize(_norm_text(question)) if len(t) >= 3}
+    if not q_tokens or not docs:
+        return None
+
+    action_terms = (
+        "must",
+        "required",
+        "request",
+        "apply",
+        "need",
+        "submit",
+        "register",
+        "book",
+        "contact",
+        "complete",
+        "confirm",
+        "follow",
+    )
+    noise_terms = (
+        "library",
+        "learning how to search",
+        "website navigation",
+        "breadcrumb",
+        "click here",
+    )
+    qn = _norm_text(question)
+    required_terms: set[str] = set()
+    if any(t in qn for t in ("codice fiscale", "fiscal code", "tax code")):
+        required_terms |= {"fiscal", "codice", "tax", "immigration", "permit", "visa"}
+    if "exchange" in qn or "study abroad" in qn:
+        required_terms |= {"exchange", "application", "deadline", "gpa", "credits", "mobility"}
+    if any(t in qn for t in ("internship", "tirocinio")):
+        required_terms |= {"internship", "career services", "activation", "activate", "documents", "training"}
+    internship_curricular_focus = "internship" in qn and any(t in qn for t in ("curricular", "credits", "credit"))
+    internship_invalidity_focus = "internship" in qn and any(t in qn for t in ("invalid", "mistake", "invalid for credits"))
+    msc_focus = any(t in qn for t in ("msc", "master of science", "graduate student", "first-year msc", "first year msc"))
+    if any(t in qn for t in ("visa", "permit of stay", "permesso")):
+        required_terms |= {"visa", "permit", "immigration", "documents", "required"}
+    if any(t in qn for t in ("housing", "accommodation", "residence", "alloggio")):
+        required_terms |= {"housing", "residence", "application", "requirements", "documents"}
+
+    def _clean_sentence(s: str) -> str:
+        s = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1", s)
+        s = re.sub(r"#+\s*", "", s)
+        s = re.sub(r"\*\*+", "", s)
+        s = re.sub(r"_+", "", s)
+        s = re.sub(r"ATTENTION PLEASE!?", "", s, flags=re.IGNORECASE)
+        s = re.sub(r"Welcome activities.*$", "", s, flags=re.IGNORECASE)
+        s = re.sub(r"useful tips.*$", "", s, flags=re.IGNORECASE)
+        s = re.sub(r"\s+", " ", s).strip(" -:;")
+        # Drop dangling tails that are usually nav/promo leftovers.
+        if s.lower().endswith(("through the", "on the", "to the", "from the")):
+            s = ""
+        # Keep only complete-looking statements.
+        if s and not re.search(r"[.!?]$", s):
+            # Accept imperative-like bullets, reject obviously truncated fragments.
+            if len(s.split()) > 18:
+                s = ""
+        return s
+
+    working_docs = list(docs[:6])
+    if internship_curricular_focus:
+        filtered_docs = []
+        for d in working_docs:
+            path_l = _norm_text(d.path)
+            if any(x in path_l for x in ("extracurricular", "after-graduation", "switch-curricular-extracurricular")):
+                continue
+            filtered_docs.append(d)
+        if filtered_docs:
+            working_docs = filtered_docs
+
+    candidates: list[tuple[float, str]] = []
+    for doc in working_docs[:5]:
+        for raw in re.split(r"(?<=[.!?])\s+", doc.content):
+            s = _clean_sentence(raw)
+            if len(s) < 40 or len(s) > 240:
+                continue
+            ns = _norm_text(s)
+            if any(n in ns for n in noise_terms):
+                continue
+            if required_terms and not any(t in ns for t in required_terms):
+                continue
+            if internship_curricular_focus and "extracurricular" in ns:
+                continue
+            if internship_curricular_focus and "after graduation" in ns:
+                continue
+            if internship_curricular_focus and "after the awarding of the degree" in ns:
+                continue
+            if internship_curricular_focus and "lombardy" in ns and "curricular" in ns:
+                continue
+            if msc_focus and "bsc students" in ns:
+                continue
+            if msc_focus and "law students" in ns:
+                continue
+            overlap = len(q_tokens & set(_tokenize(ns)))
+            if overlap <= 0:
+                continue
+            action_bonus = 0.8 if any(a in ns for a in action_terms) else 0.0
+            curricular_bonus = 0.6 if internship_curricular_focus and any(
+                t in ns for t in ("curricular", "credits", "activation", "before start", "signature", "required")
+            ) else 0.0
+            invalidity_bonus = 0.6 if internship_invalidity_focus and any(
+                t in ns for t in ("invalid", "not valid", "must", "required", "before start", "signature", "recognition")
+            ) else 0.0
+            score = overlap + action_bonus + curricular_bonus + invalidity_bonus
+            if score < 1.8:
+                continue
+            candidates.append((score, s))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    picked: list[str] = []
+    seen = set()
+    for _, s in candidates:
+        key = _norm_text(s)
+        if key in seen:
+            continue
+        seen.add(key)
+        picked.append(s)
+        if len(picked) >= 4:
+            break
+
+    # Ensure at least 3 practical bullets when possible.
+    if len(picked) < 3:
+        for doc in working_docs[:3]:
+            for raw in re.split(r"(?<=[.!?])\s+", doc.content):
+                s = _clean_sentence(raw)
+                if len(s) < 35 or len(s) > 220:
+                    continue
+                ns = _norm_text(s)
+                if any(n in ns for n in noise_terms):
+                    continue
+                if required_terms and not any(t in ns for t in required_terms):
+                    continue
+                if internship_curricular_focus and "extracurricular" in ns:
+                    continue
+                if internship_curricular_focus and "after graduation" in ns:
+                    continue
+                if internship_curricular_focus and "after the awarding of the degree" in ns:
+                    continue
+                if internship_curricular_focus and "lombardy" in ns and "curricular" in ns:
+                    continue
+                if msc_focus and "bsc students" in ns:
+                    continue
+                if msc_focus and "law students" in ns:
+                    continue
+                if not any(a in ns for a in action_terms):
+                    continue
+                key = _norm_text(s)
+                if key in seen:
+                    continue
+                seen.add(key)
+                picked.append(s)
+                if len(picked) >= 3:
+                    break
+            if len(picked) >= 3:
+                break
+
+    if not picked:
+        return None
+
+    intro = "Here is the recommended process based on Bocconi information:"
+    if any(t in _norm_text(question) for t in ("codice fiscale", "fiscal code", "tax code")):
+        intro = "To get your Codice Fiscale, follow this practical sequence:"
+    return intro + "\n- " + "\n- ".join(picked)
+
+
+def _answer_fails_quality_gate(question: str, answer: str) -> bool:
+    q = _norm_text(question)
+    a = _norm_text(answer)
+    if not a or len(a) < 25:
+        return True
+
+    # Common UX artifacts / noisy fragments we don't want to show.
+    bad_fragments = (
+        "no structured safety field returned",
+        "website navigation",
+        "learning how to search",
+        "breadcrumb",
+        "click here",
+    )
+    if any(b in a for b in bad_fragments):
+        return True
+
+    # If the question is clearly about one admin topic, suppress obvious cross-topic leakage.
+    if any(t in q for t in ("codice fiscale", "fiscal code", "tax code")):
+        if "library" in a and "library" not in q:
+            return True
+        if "sport membership" in a and "sport" not in q:
+            return True
+
+    # Minimal lexical grounding check: answer should share enough content words with question.
+    q_tokens = {t for t in _tokenize(q) if len(t) >= 4 and t not in GENERIC_STOPWORDS}
+    a_tokens = {t for t in _tokenize(a) if len(t) >= 4 and t not in GENERIC_STOPWORDS}
+    if q_tokens:
+        overlap = len(q_tokens & a_tokens) / max(1, len(q_tokens))
+        if overlap < 0.18:
+            return True
+    return False
+
+
+def _filter_sources_for_procedural_question(question: str, docs: list[Document], sources: list[str]) -> list[str]:
+    qn = _norm_text(question)
+    required_terms: set[str] = set()
+    if any(t in qn for t in ("codice fiscale", "fiscal code", "tax code")):
+        required_terms |= {"fiscal", "codice", "tax", "immigration", "permit", "visa", "documents"}
+    if "exchange" in qn or "study abroad" in qn:
+        required_terms |= {"exchange", "application", "deadline", "mobility", "credits", "gpa"}
+    if any(t in qn for t in ("internship", "tirocinio")):
+        required_terms |= {"internship", "career", "activation", "documents", "training"}
+    if not required_terms:
+        return sources
+
+    doc_by_path = {d.path: d for d in docs}
+    kept: list[str] = []
+    internship_curricular_focus = "internship" in qn and any(t in qn for t in ("curricular", "credits", "credit"))
+    for s in sources:
+        d = doc_by_path.get(s)
+        hay = _norm_text(s if d is None else f"{d.path} {d.title} {d.content[:400]}")
+        if internship_curricular_focus and any(x in hay for x in ("extracurricular", "after-graduation", "switch-curricular-extracurricular")):
+            continue
+        if any(t in hay for t in required_terms):
+            kept.append(s)
+    return kept or sources
+
+
+CARD_SKIP_RE = re.compile(
+    r"cannot answer|cannot fetch|don't have reliable|do not have reliable|"
+    r"i don't know|outside the assistant scope|outside bocconi buddy scope|"
+    r"insufficient|not enough context",
+    re.IGNORECASE,
+)
+
+CARD_TITLE_STOPWORDS = {
+    "what",
+    "when",
+    "where",
+    "which",
+    "about",
+    "does",
+    "with",
+    "from",
+    "into",
+    "bocconi",
+    "should",
+    "could",
+    "would",
+    "there",
+    "their",
+    "after",
+    "before",
+    "student",
+    "students",
+}
+
+
+def _canonical_card_terms(text: str) -> set[str]:
+    terms = set()
+    for token in _tokenize(text):
+        if token in CARD_TITLE_STOPWORDS or len(token) < 3:
+            continue
+        if token.endswith("ies") and len(token) > 5:
+            token = token[:-3] + "y"
+        elif token.endswith("s") and len(token) > 4:
+            token = token[:-1]
+        terms.add(token)
+    return terms
+
+
+def _card_term_similarity(left: str | list[str], right: str | list[str]) -> float:
+    left_text = " ".join(left) if isinstance(left, list) else left
+    right_text = " ".join(right) if isinstance(right, list) else right
+    left_terms = _canonical_card_terms(left_text)
+    right_terms = _canonical_card_terms(right_text)
+    if not left_terms or not right_terms:
+        return 0.0
+    return len(left_terms & right_terms) / len(left_terms | right_terms)
+
+
+def _answer_can_unlock_card(answer: str) -> bool:
+    compact = re.sub(r"\s+", " ", answer).strip()
+    if len(compact) < 40:
+        return False
+    return CARD_SKIP_RE.search(compact) is None
+
+
+def _next_card_id(verticale: Verticale, cards: list[BocCard]) -> str:
+    vertical_number = VERTICALI.index(verticale) + 1
+    prefix = f"V{vertical_number:02d}"
+    existing_numbers = [0]
+    pattern = re.compile(rf"^{prefix}-(\d+)$")
+    for card in cards:
+        if card.vertical != verticale:
+            continue
+        match = pattern.match(card.id)
+        if match:
+            existing_numbers.append(int(match.group(1)))
+    return f"{prefix}-{max(existing_numbers) + 1:03d}"
+
+
+def _make_card_title(question: str) -> str:
+    words = [
+        token
+        for token in _tokenize(question)
+        if len(token) > 2 and token not in CARD_TITLE_STOPWORDS
+    ][:6]
+    title = " ".join(words) if words else "Campus Discovery"
+    return title.title()
+
+
+def _trim_to_card_body(text: str, max_length: int = 270) -> str:
+    compact = re.sub(r"\s+", " ", text).strip()
+    if len(compact) <= max_length:
+        return compact
+    clipped = compact[: max_length - 1]
+    sentence_end = max(clipped.rfind("."), clipped.rfind(";"))
+    if sentence_end > 120:
+        return clipped[: sentence_end + 1]
+    word_end = clipped.rfind(" ")
+    return f"{clipped[:word_end if word_end > 80 else len(clipped)]}..."
+
+
+def _extract_card_fact(answer: str) -> str:
+    match = re.search(
+        r"(~?€\s?[\d,.]+|[\d,.]+\s?(?:%|ECTS|countries|partners|months|weeks|hours|days))",
+        answer,
+        re.IGNORECASE,
+    )
+    return match.group(0) if match else "2026 snapshot"
+
+
+def _short_card_source(source: str) -> str:
+    clean = source.split("/")[-1].removesuffix(".md")
+    return re.sub(r"[-_]+", " ", clean or source)[:42]
+
+
+CARD_IMAGE_MARKDOWN_RE = re.compile(r"!\[([^\]]*)\]\((https?://[^)\s]+)\)", re.IGNORECASE)
+CARD_IMAGE_URL_RE = re.compile(
+    r"https?://[^\s)\"']+\.(?:jpg|jpeg|png|webp)(?:\?[^\s)\"']+)?",
+    re.IGNORECASE,
+)
+CARD_IMAGE_NOISE_TERMS = {
+    "logo",
+    "icon",
+    "flag",
+    "mapfiles",
+    "property-pin",
+    "university-pin",
+    "facebook",
+    "twitter",
+    "linkedin",
+    "youtube",
+    "validatore",
+    "telefono",
+}
+CARD_FALLBACK_IMAGES: dict[Verticale, tuple[str, str, CardImageSource]] = {
+    "relocation": (
+        "https://www.unibocconi.it/sites/default/files/styles/fullwidth_xxl/public/media/images/piazza_gae_aulenti_0.jpg.webp?itok=m2__eciS",
+        "Piazza Gae Aulenti in Milan",
+        "dataset",
+    ),
+    "life_on_campus": (
+        "https://www.unibocconi.it/sites/default/files/styles/link_card/public/media/images/studenti_4.jpg.webp?itok=gdH9KVpy",
+        "Bocconi students gathered on campus",
+        "dataset",
+    ),
+    "study_abroad": (
+        "https://www.unibocconi.it/sites/default/files/styles/fullwidth_xxl/public/media/images/_mg_7245_0_0.jpg.webp?itok=bsdBRWTs",
+        "Bocconi international mobility students",
+        "dataset",
+    ),
+    "career_readiness": (
+        "https://www.unibocconi.it/sites/default/files/styles/highlight_slide/public/media/images/ipp-402.jpg.webp?itok=q3qk9oCr",
+        "BocconiJobs career event",
+        "dataset",
+    ),
+}
+
+
+def _resolve_data_source_path(source: str) -> Path | None:
+    if source.startswith(("http://", "https://")):
+        return None
+
+    raw_path = Path(source)
+    candidates = []
+    if raw_path.is_absolute():
+        candidates.append(raw_path)
+    else:
+        parts = raw_path.parts
+        if parts and parts[0] == "backend":
+            candidates.append(Path(__file__).parent.parent / raw_path)
+        elif parts and parts[0] == "data":
+            candidates.append(Path(__file__).parent / raw_path)
+        else:
+            candidates.append(DATA_DIR / raw_path)
+
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+            resolved.relative_to(DATA_DIR.resolve())
+        except (OSError, ValueError):
+            continue
+        if resolved.is_file():
+            return resolved
+    return None
+
+
+def _is_image_url(url: str) -> bool:
+    lower = urllib.parse.unquote(url.lower())
+    return any(ext in lower for ext in (".jpg", ".jpeg", ".png", ".webp"))
+
+
+def _card_image_score(url: str, alt: str, question: str, verticale: Verticale) -> int:
+    candidate_text = _norm_text(f"{urllib.parse.unquote(url)} {alt}")
+    if any(term in candidate_text for term in CARD_IMAGE_NOISE_TERMS):
+        return -100
+
+    query_terms = _canonical_card_terms(question)
+    score = 0
+    score += sum(2 for term in query_terms if term in candidate_text)
+    if "bocconi" in candidate_text or "unibocconi" in candidate_text:
+        score += 4
+    if any(term in candidate_text for term in ("student", "studenti", "campus", "milano", "milan")):
+        score += 2
+    if any(term in candidate_text for term in ("fullwidth", "highlight", "container_100", "link_card", "image_compression")):
+        score += 1
+    if verticale == "relocation" and any(term in candidate_text for term in ("milan", "milano", "housing", "casa", "trasport")):
+        score += 2
+    if verticale == "life_on_campus" and any(term in candidate_text for term in ("campus", "student", "sport", "library", "wellbeing")):
+        score += 2
+    if verticale == "study_abroad" and any(term in candidate_text for term in ("international", "exchange", "abroad", "mobility")):
+        score += 2
+    if verticale == "career_readiness" and any(term in candidate_text for term in ("career", "job", "faculty", "alumni", "internship")):
+        score += 2
+    return score
+
+
+def _extract_dataset_image_from_sources(
+    sources: list[str],
+    question: str,
+    verticale: Verticale,
+) -> tuple[str, str, CardImageSource] | None:
+    candidates: list[tuple[int, str, str]] = []
+
+    for source in sources[:5]:
+        if source.startswith(("http://", "https://")) and _is_image_url(source):
+            candidates.append((_card_image_score(source, "", question, verticale), source, "Card source image"))
+            continue
+
+        source_path = _resolve_data_source_path(source)
+        if source_path is None:
+            continue
+        try:
+            raw = source_path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+
+        seen: set[str] = set()
+        for match in CARD_IMAGE_MARKDOWN_RE.finditer(raw):
+            alt, url = match.group(1).strip(), match.group(2).strip()
+            if url in seen or not _is_image_url(url):
+                continue
+            seen.add(url)
+            candidates.append((_card_image_score(url, alt, question, verticale), url, alt or "Bocconi source image"))
+
+        for match in CARD_IMAGE_URL_RE.finditer(raw):
+            url = match.group(0).strip()
+            if url in seen or not _is_image_url(url):
+                continue
+            seen.add(url)
+            candidates.append((_card_image_score(url, "", question, verticale), url, "Bocconi source image"))
+
+    if not candidates:
+        return None
+
+    score, url, alt = max(candidates, key=lambda item: item[0])
+    if score < 0:
+        return None
+    return url, alt, "dataset"
+
+
+def _fallback_card_image(verticale: Verticale, title: str) -> tuple[str | None, str | None, CardImageSource]:
+    fallback = CARD_FALLBACK_IMAGES.get(verticale)
+    if fallback:
+        url, alt, source = fallback
+        return url, f"{alt} for {title}", source
+    return None, None, "placeholder"
+
+
+def _score_card_rarity(question: str, answer: str, sources: list[str]) -> tuple[Rarity, int]:
+    """Score rarity from observable card qualities.
+
+    Rarity is intentionally deterministic so the collection feels earned:
+    live/current sources, multiple sources, concrete numbers, specific Bocconi
+    terms, procedural depth, and longer grounded answers all add weight.
+    """
+    q = _norm_text(question)
+    a = _norm_text(answer)
+    source_text = _norm_text(" ".join(sources))
+    score = 0
+
+    if any(source.startswith(("http://", "https://")) for source in sources):
+        score += 3
+    if len(set(sources)) >= 2:
+        score += 1
+    if len(set(sources)) >= 4:
+        score += 1
+    if re.search(r"(~?€\s?[\d,.]+|[\d,.]+\s?(?:%|ects|countries|partners|months|weeks|hours|days))", answer, re.IGNORECASE):
+        score += 2
+    if any(
+        term in f"{q} {a}"
+        for term in (
+            "codice fiscale",
+            "permit of stay",
+            "jobgate",
+            "erasmus",
+            "double degree",
+            "almalaurea",
+            "viaggiaresicuri",
+            "bocconi sport",
+            "ssn",
+        )
+    ):
+        score += 1
+    if answer.count("\n- ") >= 3 or sum(1 for word in ("apply", "request", "submit", "register", "deadline") if word in a) >= 2:
+        score += 1
+    if len(answer) >= 520:
+        score += 1
+    if any(term in source_text for term in ("almalaurea", "viaggiaresicuri", "comune", "yesmilano", "gtfs")):
+        score += 1
+
+    if score >= 8:
+        return "ultra-rare", score
+    if score >= 5:
+        return "rare", score
+    if score >= 2:
+        return "uncommon", score
+    return "common", score
+
+
+def _build_unlocked_card(request: CardDecisionRequest) -> BocCard | None:
+    answer = request.answer.strip()
+    if not _answer_can_unlock_card(answer):
+        return None
+
+    source = request.sources[0] if request.sources else "Bocconi 2026 dataset"
+    has_live_source = any(source.startswith(("http://", "https://")) for source in request.sources)
+    tags = list(dict.fromkeys(_canonical_card_terms(request.question)))[:6]
+    rarity, _rarity_score = _score_card_rarity(request.question, answer, request.sources)
+    title = _make_card_title(request.question)
+    image_url, image_alt, image_source = _extract_dataset_image_from_sources(
+        request.sources,
+        request.question,
+        request.verticale,
+    ) or _fallback_card_image(request.verticale, title)
+
+    return BocCard(
+        id=_next_card_id(request.verticale, request.cards),
+        vertical=request.verticale,
+        title=title,
+        body=_trim_to_card_body(answer),
+        longBody=answer,
+        factTag=_extract_card_fact(answer),
+        imageQuery=request.question,
+        imageUrl=image_url,
+        imageAlt=image_alt,
+        imageSource=image_source,
+        rarity=rarity,
+        isStarter=False,
+        sourceLabel=_short_card_source(source),
+        datasetSnapshot="live" if has_live_source else "2026-05-02",
+        unlockedAt=datetime.now(UTC).isoformat(),
+        tags=tags,
+    )
+
+
+def _find_owned_duplicate(candidate: BocCard, cards: list[BocCard], collected_ids: list[str]) -> BocCard | None:
+    collected = set(collected_ids)
+    best: tuple[float, BocCard] | None = None
+
+    for card in cards:
+        if card.id not in collected or card.vertical != candidate.vertical:
+            continue
+
+        title_score = _card_term_similarity(card.title, candidate.title)
+        tag_score = _card_term_similarity(card.tags, candidate.tags)
+        duplicate_score = title_score * 0.75 + tag_score * 0.25
+        is_duplicate = (
+            title_score >= 0.72
+            or (title_score >= 0.45 and tag_score >= 0.45)
+            or (title_score >= 0.20 and tag_score >= 0.62)
+            or duplicate_score >= 0.56
+        )
+        if not is_duplicate:
+            continue
+        if best is None or duplicate_score > best[0]:
+            best = (duplicate_score, card)
+
+    return best[1] if best else None
 
 
 _build_local_index()
@@ -1246,12 +2156,47 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.post("/cards/decision", response_model=CardDecisionResponse)
+def decide_card(request: CardDecisionRequest) -> CardDecisionResponse:
+    candidate = _build_unlocked_card(request)
+    if candidate is None:
+        return CardDecisionResponse(
+            action="skipped",
+            message="No new card was created for this answer.",
+        )
+
+    duplicate = _find_owned_duplicate(candidate, request.cards, request.collected_card_ids)
+    if duplicate is not None:
+        return CardDecisionResponse(
+            action="already_owned",
+            card=duplicate,
+            existing_card_id=duplicate.id,
+            message=f"You already have this card: {duplicate.title}.",
+        )
+
+    return CardDecisionResponse(
+        action="created",
+        card=candidate,
+        message=f"New card added to your collection: {candidate.title}.",
+    )
+
+
 @app.post("/ask", response_model=AskResponse)
 def ask(request: AskRequest) -> AskResponse:
     question = (request.question or "").strip()
     if not question:
         return AskResponse(
             answer="I cannot answer right now.",
+            sources=[],
+            verticale="relocation",
+        )
+
+    if _is_high_risk_live_fact_question(question):
+        return AskResponse(
+            answer=(
+                "I cannot answer right now with exact live weather values because forecasts change continuously. "
+                "Please check a live official forecast source for the exact hour."
+            ),
             sources=[],
             verticale="relocation",
         )
@@ -1304,9 +2249,12 @@ def ask(request: AskRequest) -> AskResponse:
             verticale="life_on_campus",
         )
 
+    safety: tuple[str, list[str]] | None = None
+    is_multi_intent = _is_multi_intent_question(question)
     if _is_travel_safety_question(question):
         safety = _fetch_viaggiaresicuri_answer(question)
-        if safety is not None:
+        # Preserve the fast path only for clearly single-intent safety asks.
+        if safety is not None and not is_multi_intent:
             answer, safety_sources = safety
             return AskResponse(answer=answer, sources=safety_sources, verticale="study_abroad")
 
@@ -1363,5 +2311,36 @@ def ask(request: AskRequest) -> AskResponse:
     answer = _call_llm_with_retry(messages)
     if not answer:
         answer = _extractive_fallback_answer(question, docs)
+
+    if _has_unavailability_guard(question) and _is_exact_deadline_question(question):
+        if (not _supports_entity_in_docs(question, docs)) or (not _contains_concrete_date(answer)):
+            answer = (
+                "I cannot answer right now because the exact deadline is not available in the indexed data."
+            )
+            sources = [d.path for d in docs[:3]]
+
+    procedural_answer = None
+    if _should_use_procedural_override(question):
+        procedural_answer = _build_procedural_answer(question, docs, verticale)
+
+    # Prefer deterministic procedural rendering when available to avoid noisy mixed fragments.
+    if procedural_answer:
+        answer = procedural_answer
+        sources = _filter_sources_for_procedural_question(question, docs, sources)
+
+    if safety is not None and is_multi_intent:
+        safety_answer, safety_sources = safety
+        safety_note = safety_answer.strip()
+        # Keep this concise so the main RAG answer remains primary.
+        if len(safety_note) > 260:
+            safety_note = safety_note[:260].rstrip() + "..."
+        answer = f"{answer}\n\nTravel safety note: {safety_note}"
+        sources = list(dict.fromkeys(sources + safety_sources))
+
+    if _answer_fails_quality_gate(question, answer):
+        recovered = _build_procedural_answer(question, docs, verticale)
+        if not recovered:
+            recovered = _extractive_fallback_answer(question, docs)
+        answer = recovered
 
     return AskResponse(answer=answer, sources=sources, verticale=verticale)
