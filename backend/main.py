@@ -15,6 +15,7 @@ import urllib.request
 import zipfile
 import io
 import threading
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -79,6 +80,11 @@ MIN_SCOPE_OVERLAP = int(os.environ.get("MIN_SCOPE_OVERLAP", "2"))
 SEARCH_AGENT_SCRIPT = Path(__file__).parent / "scripts" / "trusted_sources_agent.py"
 MIN_SCOPE_COVERAGE = float(os.environ.get("MIN_SCOPE_COVERAGE", "0.18"))
 API_CACHE_TTL_SECONDS = int(os.environ.get("API_CACHE_TTL_SECONDS", "1800"))
+EMBEDDING_RERANK_ENABLED = os.environ.get("EMBEDDING_RERANK_ENABLED", "1") == "1"
+EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "text-embedding-3-small")
+EMBEDDING_RERANK_CANDIDATES = int(os.environ.get("EMBEDDING_RERANK_CANDIDATES", "18"))
+EMBEDDING_WEIGHT = float(os.environ.get("EMBEDDING_WEIGHT", "4.0"))
+LEXICAL_RERANK_WEIGHT = float(os.environ.get("LEXICAL_RERANK_WEIGHT", "1.5"))
 OUT_OF_DOMAIN_HINTS = {
     "weather",
     "umbrella",
@@ -115,6 +121,9 @@ COUNTRY_ISO3: dict[str, str] = {
 
 _API_CACHE_LOCK = threading.Lock()
 _API_CACHE: dict[str, tuple[float, tuple[str, list[str]] | None]] = {}
+_EMBEDDING_LOCK = threading.Lock()
+_DOC_EMBED_CACHE: dict[str, list[float]] = {}
+_QUERY_EMBED_CACHE: dict[str, list[float]] = {}
 
 client: OpenAI | None = None
 if os.environ.get("OPENAI_API_KEY"):
@@ -195,6 +204,12 @@ VERTICALE_KEYWORDS: dict[Verticale, set[str]] = {
         "stage",
         "lavoro",
         "tirocinio",
+        "scholarship",
+        "merit award",
+        "tuition waiver",
+        "financial aid",
+        "placement",
+        "graduate survey",
     },
 }
 
@@ -220,6 +235,63 @@ CAREER_QUERY_EXPANSIONS = {
         "employers",
         "bocconi jobs",
     ],
+}
+
+GENERIC_STOPWORDS = {
+    "the",
+    "a",
+    "an",
+    "and",
+    "or",
+    "to",
+    "for",
+    "of",
+    "in",
+    "on",
+    "at",
+    "with",
+    "about",
+    "how",
+    "what",
+    "which",
+    "should",
+    "could",
+    "would",
+    "can",
+    "is",
+    "are",
+    "i",
+    "me",
+    "my",
+    "we",
+    "our",
+    "you",
+    "your",
+}
+
+VERTICALE_REWRITE_HINTS: dict[Verticale, dict[str, list[str]]] = {
+    "relocation": {
+        "housing": ["housing", "residence", "accommodation", "rent", "alloggio"],
+        "documents": ["visa", "permit of stay", "codice fiscale", "immigration documentation"],
+        "transport": ["atm", "metro", "tram", "bus", "transport", "gtfs"],
+        "airports": ["linate", "malpensa", "centrale", "commute", "public transport"],
+    },
+    "life_on_campus": {
+        "associations": ["student associations", "student reps", "campus life", "community"],
+        "services": ["library", "support services", "wellbeing", "inclusion", "counseling"],
+        "events": ["events", "workshops", "seminars", "welcome days"],
+        "city_events": ["yesmilano", "whats on", "all events", "weekend in milano"],
+    },
+    "study_abroad": {
+        "exchange": ["exchange program", "selection criteria", "apply accept withdraw"],
+        "departure": ["before departure", "health insurance", "academic recognition", "destinations"],
+        "language": ["language requirement", "certificate", "eligibility"],
+    },
+    "career_readiness": {
+        "sustainability": ["transformative sustainability", "esg", "impact", "sustainable finance"],
+        "internship": ["career services", "curricular internship", "placement", "employers"],
+        "jobs": ["career fairs", "bocconi jobs", "recruiting", "job market"],
+    },
 }
 
 
@@ -328,6 +400,47 @@ def _expand_query(question: str, verticale: Verticale) -> str:
     return f"{question} {' '.join(sorted(set(expanded_terms)))}"
 
 
+def _simplify_query(question: str) -> str:
+    # Keep informative tokens and strip filler wording.
+    tokens = _tokenize(question)
+    kept = [t for t in tokens if len(t) >= 3 and t not in GENERIC_STOPWORDS]
+    return " ".join(kept[:16]) if kept else question
+
+
+def _rewrite_query(question: str, verticale: Verticale) -> str:
+    """Cheap deterministic query rewriting for better retrieval.
+
+    Goal: keep user intent while producing a denser search query.
+    """
+    base = _simplify_query(question)
+    q_norm = _norm_text(question)
+    hints = VERTICALE_REWRITE_HINTS.get(verticale, {})
+
+    extra_terms: list[str] = []
+    for _, terms in hints.items():
+        # If any term in a hint bucket appears, append the full bucket.
+        if any(t in q_norm for t in terms):
+            extra_terms.extend(terms)
+
+    # Reuse existing career-specific expansion logic.
+    expanded = _expand_query(question, verticale)
+    if expanded != question:
+        extra_terms.extend(_tokenize(expanded))
+
+    dedup = []
+    seen = set()
+    for t in _tokenize(base) + extra_terms:
+        key = t.strip().lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        dedup.append(key)
+        if len(dedup) >= 28:
+            break
+
+    return " ".join(dedup) if dedup else question
+
+
 def _keyword_score(doc: Document, q_tokens: set[str], q_norm: str) -> float:
     # BM25-style lite: strong reward for exact term matches and title hits.
     overlap = len(q_tokens & doc.token_set)
@@ -402,12 +515,33 @@ def _career_intent_adjustment(question: str, doc: Document) -> float:
     return score
 
 
+def _relocation_intent_adjustment(question: str, doc: Document) -> float:
+    q = _norm_text(question)
+    text = f"{doc.title_text} {_norm_text(doc.path)}"
+    score = 0.0
+
+    scholarship_intent = any(
+        t in q
+        for t in ("scholarship", "merit award", "tuition waiver", "waiver", "fees", "financial aid", "funding")
+    )
+    if not scholarship_intent:
+        return score
+
+    if any(t in text for t in ("funding", "scholarship", "tuition", "fees", "merit")):
+        score += 2.5
+    if "housing" in text and "tuition" not in text and "scholarship" not in text:
+        score -= 3.0
+    return score
+
+
 def _intent_adjustment(question: str, verticale: Verticale, doc: Document) -> float:
     q = _norm_text(question)
     doc_key = _norm_text(doc.path + " " + doc.title)
     if verticale == "relocation" and any(t in q for t in ("required documents", "documents", "first steps", "moving to milan")):
         if "external-relocation-required-documents-checklist" in doc_key:
             return 5.0
+    if verticale == "relocation":
+        return _relocation_intent_adjustment(question, doc)
     if verticale == "life_on_campus" and any(t in q for t in ("integrate", "first-year", "first month", "associations", "campus services")):
         if "external-campus-integration-first-month-pack" in doc_key:
             return 5.0
@@ -433,8 +567,94 @@ def _intent_doc_allowed(question: str, verticale: Verticale, doc: Document) -> b
     return True
 
 
+def _cosine(a: list[float], b: list[float]) -> float:
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b))
+    na = math.sqrt(sum(x * x for x in a))
+    nb = math.sqrt(sum(y * y for y in b))
+    if na == 0.0 or nb == 0.0:
+        return 0.0
+    return dot / (na * nb)
+
+
+def _embed_text(text: str) -> list[float] | None:
+    if client is None:
+        return None
+    try:
+        resp = client.embeddings.create(
+            model=EMBEDDING_MODEL,
+            input=text[:4000],
+            timeout=min(REQUEST_TIMEOUT, 12),
+        )
+        vec = resp.data[0].embedding
+        return vec if isinstance(vec, list) else None
+    except Exception:
+        return None
+
+
+def _get_query_embedding(query: str) -> list[float] | None:
+    with _EMBEDDING_LOCK:
+        cached = _QUERY_EMBED_CACHE.get(query)
+    if cached is not None:
+        return cached
+    vec = _embed_text(query)
+    if vec is not None:
+        with _EMBEDDING_LOCK:
+            _QUERY_EMBED_CACHE[query] = vec
+    return vec
+
+
+def _get_doc_embedding(doc: Document) -> list[float] | None:
+    with _EMBEDDING_LOCK:
+        cached = _DOC_EMBED_CACHE.get(doc.path)
+    if cached is not None:
+        return cached
+    vec = _embed_text(f"{doc.title}\n{doc.content}")
+    if vec is not None:
+        with _EMBEDDING_LOCK:
+            _DOC_EMBED_CACHE[doc.path] = vec
+    return vec
+
+
+def _get_doc_embeddings_bulk(docs: list[Document]) -> dict[str, list[float]]:
+    out: dict[str, list[float]] = {}
+    missing: list[Document] = []
+
+    with _EMBEDDING_LOCK:
+        for d in docs:
+            cached = _DOC_EMBED_CACHE.get(d.path)
+            if cached is not None:
+                out[d.path] = cached
+            else:
+                missing.append(d)
+
+    if not missing or client is None:
+        return out
+
+    try:
+        resp = client.embeddings.create(
+            model=EMBEDDING_MODEL,
+            input=[f"{d.title}\n{d.content}"[:4000] for d in missing],
+            timeout=min(REQUEST_TIMEOUT, 12),
+        )
+    except Exception:
+        # Graceful fallback: keep any cached vectors and let the pipeline continue.
+        return out
+
+    with _EMBEDDING_LOCK:
+        for d, item in zip(missing, resp.data):
+            vec = item.embedding if isinstance(item.embedding, list) else None
+            if vec is None:
+                continue
+            _DOC_EMBED_CACHE[d.path] = vec
+            out[d.path] = vec
+
+    return out
+
+
 def _retrieve_docs(question: str, verticale: Verticale, k: int = TOP_K) -> list[Document]:
-    rewritten_query = _expand_query(question, verticale)
+    rewritten_query = _rewrite_query(question, verticale)
     q_norm = _norm_text(rewritten_query)
     q_tokens = set(_tokenize(q_norm))
     if not q_tokens:
@@ -479,10 +699,44 @@ def _retrieve_docs(question: str, verticale: Verticale, k: int = TOP_K) -> list[
         )
         rescored.append((score, d))
     rescored.sort(key=lambda x: x[0], reverse=True)
-    filtered = [d for _, d in rescored if _intent_doc_allowed(question, verticale, d)]
-    if filtered:
-        return filtered[:k]
-    return [d for _, d in rescored[:k]]
+    ordered_docs = [d for _, d in rescored]
+    filtered = [d for d in ordered_docs if _intent_doc_allowed(question, verticale, d)]
+    if not filtered:
+        filtered = ordered_docs
+
+    # Optional embedding rerank on top lexical/intent candidates only (fast path).
+    if EMBEDDING_RERANK_ENABLED and client is not None and filtered:
+        top_n = max(k, min(len(filtered), EMBEDDING_RERANK_CANDIDATES))
+        candidates = filtered[:top_n]
+        qvec = _get_query_embedding(rewritten_query)
+        if qvec is not None:
+            emb_scores: dict[str, float] = {}
+            doc_vecs = _get_doc_embeddings_bulk(candidates)
+            for d in candidates:
+                dvec = doc_vecs.get(d.path)
+                if dvec is not None:
+                    emb_scores[d.path] = _cosine(qvec, dvec)
+            if emb_scores:
+                blend: list[tuple[float, Document]] = []
+                base_rank = {d.path: i for i, d in enumerate(filtered)}
+                for d in candidates:
+                    rank = base_rank.get(d.path, 999)
+                    lexical_component = 1.0 / (1.0 + float(rank))
+                    semantic_component = emb_scores.get(d.path, 0.0)
+                    score = lexical_component * LEXICAL_RERANK_WEIGHT + semantic_component * EMBEDDING_WEIGHT
+                    blend.append((score, d))
+                blend.sort(key=lambda x: x[0], reverse=True)
+                top = [d for _, d in blend[:k]]
+                # Fill if needed from remaining filtered list.
+                used = {d.path for d in top}
+                for d in filtered:
+                    if len(top) >= k:
+                        break
+                    if d.path not in used:
+                        top.append(d)
+                return top[:k]
+
+    return filtered[:k]
 
 
 def _retrieval_overlap_score(question: str, docs: list[Document]) -> int:
@@ -524,12 +778,43 @@ def _is_weather_question(question: str) -> bool:
 
 def _is_transport_question(question: str) -> bool:
     q = _norm_text(question)
-    terms = ("metro", "tram", "bus", "atm", "transport", "commute", "line ", "ticket", "pass", "gtfs")
-    transport_hit = any(t in q for t in terms)
+    q_tokens = set(_tokenize(q))
+    transport_tokens = {"metro", "tram", "bus", "atm", "transport", "commute", "ticket", "gtfs", "subway"}
+    transport_phrases = (
+        "public transport",
+        "urban pass",
+        "monthly pass",
+        "annual pass",
+        "line ",
+        "linea ",
+        "malpensa bus",
+    )
+    transport_hit = bool(q_tokens & transport_tokens) or any(p in q for p in transport_phrases)
     # Keep transport API path for transport-dominant questions only.
     broader_relocation_terms = ("housing", "residence", "rent", "documents", "visa", "permit", "alloggio")
     broader_hit = any(t in q for t in broader_relocation_terms)
-    return transport_hit and not broader_hit
+    # Guard: do not hijack academic/program/funding questions.
+    academic_terms = (
+        "exchange",
+        "double degree",
+        "study abroad",
+        "deadline",
+        "application",
+        "scholarship",
+        "merit award",
+        "tuition waiver",
+        "placement",
+        "survey",
+        "bess",
+        "mit",
+        "bachelor",
+        "master of science",
+        "msc",
+        "gpa",
+        "credits",
+    )
+    academic_hit = any(t in q for t in academic_terms)
+    return transport_hit and not broader_hit and not academic_hit
 
 
 def _is_events_question(question: str) -> bool:
