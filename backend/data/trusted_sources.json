@@ -1,0 +1,76 @@
+{
+  "sources": [
+    {
+      "id": "yesmilano-living",
+      "title": "YesMilano - Living in Milano",
+      "verticale": "relocation",
+      "language": "en",
+      "type": "html",
+      "url": "https://www.yesmilano.it/en/living-in-milano",
+      "tags": ["milan", "relocation", "housing", "student-life"]
+    },
+    {
+      "id": "yesmilano-cost-of-living",
+      "title": "YesMilano - Cost of living",
+      "verticale": "relocation",
+      "language": "en",
+      "type": "html",
+      "url": "https://www.yesmilano.it/en/study/cost-living-milano",
+      "tags": ["milan", "cost", "budget", "relocation"]
+    },
+    {
+      "id": "yesmilano-getting-around",
+      "title": "YesMilano - Getting around",
+      "verticale": "relocation",
+      "language": "en",
+      "type": "html",
+      "url": "https://www.yesmilano.it/en/traveller-information/getting-around",
+      "tags": ["transport", "mobility", "relocation"]
+    },
+    {
+      "id": "yesmilano-neighborhoods",
+      "title": "YesMilano - Neighborhoods",
+      "verticale": "relocation",
+      "language": "en",
+      "type": "html",
+      "url": "https://www.yesmilano.it/en/neighborhoods",
+      "tags": ["neighborhoods", "areas", "relocation"]
+    },
+    {
+      "id": "milano-gtfs-dataset",
+      "title": "Comune di Milano - GTFS public transport dataset",
+      "verticale": "relocation",
+      "language": "it",
+      "type": "html",
+      "url": "https://dati.comune.milano.it/dataset/ds929-orari-del-trasporto-pubblico-locale-nel-comune-di-milano-in-formato-gtfs",
+      "tags": ["transport", "gtfs", "mobility", "open-data"]
+    },
+    {
+      "id": "milano-gtfs-zip",
+      "title": "Comune di Milano - GTFS ZIP",
+      "verticale": "relocation",
+      "language": "it",
+      "type": "binary_pointer",
+      "url": "https://dati.comune.milano.it/gtfs.zip",
+      "tags": ["transport", "gtfs", "open-data"]
+    },
+    {
+      "id": "istat-home",
+      "title": "ISTAT official portal",
+      "verticale": "career_readiness",
+      "language": "en",
+      "type": "html",
+      "url": "https://www.istat.it/en/",
+      "tags": ["statistics", "italy", "labor-market"]
+    },
+    {
+      "id": "almalaurea-home",
+      "title": "AlmaLaurea official portal",
+      "verticale": "career_readiness",
+      "language": "it",
+      "type": "html",
+      "url": "https://www.almalaurea.it/",
+      "tags": ["graduates", "employment", "outcomes"]
+    }
+  ]
+}
